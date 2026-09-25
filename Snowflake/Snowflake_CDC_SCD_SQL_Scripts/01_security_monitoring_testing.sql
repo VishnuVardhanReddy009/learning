@@ -1,0 +1,259 @@
+-- ============================================================
+-- FILE: 07_security/01_security.sql
+-- PURPOSE: Masking, row access, network policies, tags
+-- ============================================================
+USE ROLE SECURITYADMIN;
+
+-- Email masking
+CREATE OR REPLACE MASKING POLICY SILVER_DB.DIMENSIONS.MASK_EMAIL
+AS (v VARCHAR) RETURNS VARCHAR ->
+    CASE WHEN CURRENT_ROLE() IN ('DATA_ENG_ROLE','ETL_ADMIN_ROLE','ACCOUNTADMIN') THEN v
+         WHEN CURRENT_ROLE() = 'SR_ANALYST_ROLE'
+              THEN CONCAT(LEFT(v,2),'***@',SPLIT_PART(v,'@',2))
+         ELSE '***@***.***' END;
+
+CREATE OR REPLACE MASKING POLICY SILVER_DB.DIMENSIONS.MASK_SALARY
+AS (v NUMBER) RETURNS NUMBER ->
+    CASE WHEN CURRENT_ROLE() IN ('DATA_ENG_ROLE','ETL_ADMIN_ROLE','ACCOUNTADMIN') THEN v
+         WHEN CURRENT_ROLE() = 'SR_ANALYST_ROLE' THEN ROUND(v,-3)
+         ELSE NULL END;
+
+-- Row access policy — segment-based
+CREATE TABLE IF NOT EXISTS COMMON_DB.UTILITIES.USER_SEGMENT_ACCESS (
+    USERNAME VARCHAR(100), SEGMENT VARCHAR(30),
+    VALID_FROM DATE DEFAULT CURRENT_DATE(), VALID_TO DATE
+);
+
+CREATE OR REPLACE ROW ACCESS POLICY GOLD_DB.SALES_MART.POLICY_SEGMENT
+AS (row_segment VARCHAR) RETURNS BOOLEAN ->
+    CASE WHEN CURRENT_ROLE() IN ('DATA_ENG_ROLE','ETL_ADMIN_ROLE','ACCOUNTADMIN','SR_ANALYST_ROLE') THEN TRUE
+         ELSE EXISTS (
+             SELECT 1 FROM COMMON_DB.UTILITIES.USER_SEGMENT_ACCESS
+             WHERE USERNAME=CURRENT_USER() AND SEGMENT=row_segment
+               AND VALID_FROM<=CURRENT_DATE() AND (VALID_TO IS NULL OR VALID_TO>=CURRENT_DATE())
+         ) END;
+
+USE ROLE SYSADMIN;
+ALTER TABLE SILVER_DB.DIMENSIONS.DIM_CUSTOMERS MODIFY COLUMN EMAIL SET MASKING POLICY SILVER_DB.DIMENSIONS.MASK_EMAIL;
+ALTER TABLE SILVER_DB.DIMENSIONS.DIM_EMPLOYEES MODIFY COLUMN SALARY SET MASKING POLICY SILVER_DB.DIMENSIONS.MASK_SALARY;
+ALTER TABLE GOLD_DB.SALES_MART.DAILY_SALES_SUMMARY ADD ROW ACCESS POLICY GOLD_DB.SALES_MART.POLICY_SEGMENT ON (SEGMENT);
+
+-- Tags
+CREATE TAG IF NOT EXISTS COMMON_DB.UTILITIES.TAG_PII ALLOWED_VALUES=('email','phone','salary','name');
+ALTER TABLE SILVER_DB.DIMENSIONS.DIM_CUSTOMERS MODIFY COLUMN EMAIL SET TAG COMMON_DB.UTILITIES.TAG_PII='email';
+ALTER TABLE SILVER_DB.DIMENSIONS.DIM_EMPLOYEES MODIFY COLUMN SALARY SET TAG COMMON_DB.UTILITIES.TAG_PII='salary';
+
+-- Network policy
+USE ROLE ACCOUNTADMIN;
+CREATE NETWORK POLICY IF NOT EXISTS NP_CORPORATE
+    ALLOWED_IP_LIST=('203.0.113.0/24','198.51.100.0/24')
+    BLOCKED_IP_LIST=('198.51.100.99');
+CREATE NETWORK POLICY IF NOT EXISTS NP_ETL_SERVERS
+    ALLOWED_IP_LIST=('203.0.113.100','203.0.113.101');
+ALTER USER ETL_SERVICE_ACCOUNT SET NETWORK_POLICY=NP_ETL_SERVERS;
+
+-- Resource monitors
+CREATE RESOURCE MONITOR IF NOT EXISTS RM_MONTHLY
+    CREDIT_QUOTA=3000 FREQUENCY=MONTHLY START_TIMESTAMP=IMMEDIATELY
+    TRIGGERS ON 75 PERCENT DO NOTIFY ON 90 PERCENT DO NOTIFY
+             ON 100 PERCENT DO SUSPEND ON 115 PERCENT DO SUSPEND_IMMEDIATE;
+ALTER ACCOUNT SET RESOURCE_MONITOR=RM_MONTHLY;
+ALTER WAREHOUSE TRANSFORM_WH SET RESOURCE_MONITOR=RM_MONTHLY;
+ALTER WAREHOUSE ANALYTICS_WH SET RESOURCE_MONITOR=RM_MONTHLY;
+
+-- ============================================================
+-- FILE: 08_monitoring/01_monitoring.sql
+-- ============================================================
+
+-- CDC pipeline health dashboard
+SELECT
+    CDC_OPERATION,
+    SCD_ACTION,
+    COUNT(*)                            AS EVENT_COUNT,
+    COUNT(DISTINCT BUSINESS_KEY)        AS UNIQUE_KEYS,
+    MIN(EVENT_TS)                       AS FIRST_EVENT,
+    MAX(EVENT_TS)                       AS LAST_EVENT
+FROM CDC_DB.CONTROL.CDC_EVENT_LOG
+WHERE EVENT_TS >= DATEADD('day',-1,CURRENT_TIMESTAMP())
+GROUP BY 1,2 ORDER BY 3 DESC;
+
+-- SCD2 version distribution — how many customers have multiple versions
+SELECT
+    VERSION_NUM,
+    COUNT(DISTINCT CUSTOMER_ID)  AS CUSTOMER_COUNT,
+    ROUND(COUNT(DISTINCT CUSTOMER_ID)*100.0 /
+        SUM(COUNT(DISTINCT CUSTOMER_ID)) OVER (),2) AS PCT
+FROM SILVER_DB.DIMENSIONS.DIM_CUSTOMERS
+WHERE IS_CURRENT = FALSE
+GROUP BY 1 ORDER BY 1;
+
+-- CDC change type breakdown
+SELECT TABLE_NAME, OPERATION, COUNT(*) AS EVENTS
+FROM CDC_DB.CONTROL.CDC_EVENT_LOG
+WHERE EVENT_TS >= DATE_TRUNC('month',CURRENT_TIMESTAMP())
+GROUP BY 1,2 ORDER BY 1,3 DESC;
+
+-- Point-in-time FK resolution accuracy check
+SELECT
+    COUNT(*)                                               AS TOTAL_ORDERS,
+    SUM(CASE WHEN SK_CUSTOMER IS NULL THEN 1 ELSE 0 END)   AS MISSING_CUST_FK,
+    SUM(CASE WHEN SK_EMPLOYEE IS NULL THEN 1 ELSE 0 END)   AS MISSING_EMP_FK,
+    ROUND(SUM(CASE WHEN SK_CUSTOMER IS NULL THEN 1 ELSE 0 END)*100.0/COUNT(*),2) AS CUST_MISS_PCT
+FROM SILVER_DB.FACTS.FACT_ORDERS
+WHERE DW_CREATED_AT >= DATEADD('day',-1,CURRENT_TIMESTAMP());
+
+-- Warehouse credit consumption
+SELECT WAREHOUSE_NAME, SUM(CREDITS_USED) AS CREDITS, COUNT(*) AS SESSIONS
+FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY
+WHERE START_TIME >= DATE_TRUNC('month',CURRENT_TIMESTAMP())
+GROUP BY 1 ORDER BY 2 DESC;
+
+-- ============================================================
+-- FILE: 09_testing/01_cdc_scd_tests.sql
+-- Test scenarios for CDC and SCD2
+-- ============================================================
+
+-- TEST 1: Simulate customer segment change (SCD2 trigger)
+-- This should create a new DIM_CUSTOMERS row with higher VERSION_NUM
+INSERT INTO BRONZE_DB.RAW.RAW_CUSTOMERS
+    (CUSTOMER_ID, CUSTOMER_NAME, EMAIL, SEGMENT, LOYALTY_TIER, PREFERRED_CHANNEL,
+     CITY, STATE, COUNTRY, REGION_ID, IS_ACTIVE, _LOAD_BATCH_ID, _SRC_ROW_HASH)
+VALUES
+    ('C001','Alice Johnson','alice@example.com','Corporate','Gold','Email',
+     'New York','NY','USA','R1','TRUE',
+     'TEST_BATCH_001',
+     MD5('C001|Alice Johnson|alice@example.com|Corporate|Gold|Email|New York|NY|USA|R1|TRUE'));
+
+-- Verify initial load
+SELECT CUSTOMER_ID, SEGMENT, LOYALTY_TIER, VERSION_NUM, IS_CURRENT, EFF_START_DATE, EFF_END_DATE
+FROM SILVER_DB.DIMENSIONS.DIM_CUSTOMERS WHERE CUSTOMER_ID='C001' ORDER BY VERSION_NUM;
+
+-- Now simulate segment change: Consumer → Corporate
+INSERT INTO BRONZE_DB.RAW.RAW_CUSTOMERS
+    (CUSTOMER_ID, CUSTOMER_NAME, EMAIL, SEGMENT, LOYALTY_TIER, PREFERRED_CHANNEL,
+     CITY, STATE, COUNTRY, REGION_ID, IS_ACTIVE, _LOAD_BATCH_ID, _SRC_ROW_HASH)
+VALUES
+    ('C001','Alice Johnson','alice@example.com',
+     'Corporate',        -- CHANGED: Consumer → Corporate (SCD2 trigger!)
+     'Platinum',         -- CHANGED: Gold → Platinum (SCD2 trigger!)
+     'Email',
+     'New York','NY','USA','R1','TRUE',
+     'TEST_BATCH_002',
+     MD5('C001|Alice Johnson|alice@example.com|Corporate|Platinum|Email|New York|NY|USA|R1|TRUE'));
+
+-- After pipeline runs, verify SCD2 worked:
+-- Expected: 2 rows for C001
+-- Row 1: VERSION_NUM=1, SEGMENT=Consumer, IS_CURRENT=FALSE, EFF_END_DATE=yesterday
+-- Row 2: VERSION_NUM=2, SEGMENT=Corporate, IS_CURRENT=TRUE, PREV_SEGMENT=Consumer
+SELECT
+    CUSTOMER_ID, VERSION_NUM, SEGMENT, LOYALTY_TIER,
+    PREV_SEGMENT, PREV_LOYALTY_TIER,  -- Type 3 columns
+    IS_CURRENT, EFF_START_DATE, EFF_END_DATE, SCD_ACTION
+FROM SILVER_DB.DIMENSIONS.DIM_CUSTOMERS
+WHERE CUSTOMER_ID = 'C001'
+ORDER BY VERSION_NUM;
+
+-- TEST 2: Verify Type 1 update (email change — in-place overwrite, no new version)
+INSERT INTO BRONZE_DB.RAW.RAW_CUSTOMERS
+    (CUSTOMER_ID, CUSTOMER_NAME, EMAIL, SEGMENT, LOYALTY_TIER, PREFERRED_CHANNEL,
+     CITY, STATE, COUNTRY, REGION_ID, IS_ACTIVE, _LOAD_BATCH_ID, _SRC_ROW_HASH)
+VALUES
+    ('C001','Alice Johnson',
+     'alice.new@example.com',  -- CHANGED: email (Type 1 = overwrite, no new version)
+     'Corporate','Platinum','Email','New York','NY','USA','R1','TRUE',
+     'TEST_BATCH_003',
+     MD5('C001|Alice Johnson|alice.new@example.com|Corporate|Platinum|Email|New York|NY|USA|R1|TRUE'));
+
+-- After pipeline: should still have 2 rows, current row has new email, VERSION_NUM unchanged
+SELECT CUSTOMER_ID, VERSION_NUM, EMAIL, SEGMENT, IS_CURRENT, SCD_ACTION
+FROM SILVER_DB.DIMENSIONS.DIM_CUSTOMERS WHERE CUSTOMER_ID='C001' ORDER BY VERSION_NUM;
+
+-- TEST 3: Product price change (SCD2 + Type 4 price history)
+INSERT INTO BRONZE_DB.RAW.RAW_PRODUCTS
+    (PRODUCT_ID,PRODUCT_NAME,CATEGORY,SUB_CATEGORY,BRAND,
+     UNIT_COST,UNIT_PRICE,IS_ACTIVE,_LOAD_BATCH_ID,_SRC_ROW_HASH)
+VALUES ('P001','Widget X','Electronics','Gadgets','BrandA','50','99.99','TRUE','TEST_PROD_001',
+        MD5('P001|Widget X|Electronics|Gadgets|BrandA|50|99.99|TRUE'));
+
+-- Price increase
+INSERT INTO BRONZE_DB.RAW.RAW_PRODUCTS
+    (PRODUCT_ID,PRODUCT_NAME,CATEGORY,SUB_CATEGORY,BRAND,
+     UNIT_COST,UNIT_PRICE,IS_ACTIVE,_LOAD_BATCH_ID,_SRC_ROW_HASH)
+VALUES ('P001','Widget X','Electronics','Gadgets','BrandA',
+        '55',       -- cost increased
+        '119.99',   -- price increased → SCD2 new version
+        'TRUE','TEST_PROD_002',
+        MD5('P001|Widget X|Electronics|Gadgets|BrandA|55|119.99|TRUE'));
+
+-- Verify price history in Type 4 table
+SELECT PRODUCT_ID, UNIT_PRICE, PREV_UNIT_PRICE, PRICE_CHANGE_PCT,
+       VERSION_NUM, IS_CURRENT, EFF_START_DATE, EFF_END_DATE
+FROM SILVER_DB.DIMENSIONS.DIM_PRODUCTS WHERE PRODUCT_ID='P001' ORDER BY VERSION_NUM;
+
+SELECT * FROM SILVER_DB.DIMENSIONS.DIM_PRODUCT_PRICE_HISTORY
+WHERE PRODUCT_ID='P001' ORDER BY VALID_FROM;
+
+-- TEST 4: Verify point-in-time FK resolution in facts
+-- An order placed BEFORE the customer changed segment should
+-- still show the OLD segment SK in the fact table
+SELECT
+    f.ORDER_ID,
+    f.ORDER_DATE_KEY,
+    f.SK_CUSTOMER,
+    c_now.SEGMENT   AS CURRENT_SEGMENT,    -- today's segment
+    c_pit.SEGMENT   AS SEGMENT_AT_ORDER,   -- segment when order was placed
+    c_pit.VERSION_NUM
+FROM SILVER_DB.FACTS.FACT_ORDERS f
+LEFT JOIN SILVER_DB.DIMENSIONS.DIM_CUSTOMERS c_now
+    ON c_now.CUSTOMER_ID = 'C001' AND c_now.IS_CURRENT = TRUE
+LEFT JOIN SILVER_DB.DIMENSIONS.DIM_CUSTOMERS c_pit
+    ON c_pit.SK_CUSTOMER = f.SK_CUSTOMER   -- FK = version active at order time
+WHERE f.SK_CUSTOMER IN (
+    SELECT SK_CUSTOMER FROM SILVER_DB.DIMENSIONS.DIM_CUSTOMERS WHERE CUSTOMER_ID='C001'
+)
+ORDER BY f.ORDER_DATE_KEY;
+
+-- TEST 5: Query customer journey across segment changes
+SELECT
+    CUSTOMER_ID,
+    VERSION_NUM,
+    SEGMENT_AT_VERSION,
+    LOYALTY_AT_VERSION,
+    PREV_SEGMENT,
+    EFF_START_DATE,
+    EFF_END_DATE,
+    DAYS_AT_VERSION,
+    REVENUE_IN_THIS_VERSION
+FROM GOLD_DB.REPORTING.V_CUSTOMER_SEGMENT_JOURNEY
+WHERE CUSTOMER_ID='C001'
+ORDER BY VERSION_NUM;
+
+-- TEST 6: CDC state tracking — verify hash state updated correctly
+SELECT TABLE_NAME, BUSINESS_KEY, LAST_HASH, CURRENT_VERSION, LAST_UPDATED_AT
+FROM CDC_DB.CONTROL.CDC_STATE
+WHERE TABLE_NAME='RAW_CUSTOMERS' AND BUSINESS_KEY='C001';
+
+-- TEST 7: Full CDC event audit trail for C001
+SELECT EVENT_TS, OPERATION, SCD_ACTION, BEFORE_HASH, AFTER_HASH, CHANGED_COLUMNS
+FROM CDC_DB.CONTROL.CDC_EVENT_LOG
+WHERE TABLE_NAME='RAW_CUSTOMERS' AND BUSINESS_KEY='C001'
+ORDER BY EVENT_TS;
+
+-- ─────────────────────────────────────────────────────────────
+-- SCD TYPE COMPARISON CHEAT SHEET
+-- ─────────────────────────────────────────────────────────────
+-- SCD0: Never change. DIM_DATE — 2024-01-15 is always a Monday.
+-- SCD1: Overwrite. DIM_STORES — store moved to new address, old address gone.
+-- SCD2: New row. DIM_CUSTOMERS — customer moved to Corporate segment.
+--              Old row: IS_CURRENT=FALSE, EFF_END_DATE=yesterday
+--              New row: IS_CURRENT=TRUE,  EFF_START_DATE=today
+-- SCD3: Add column. PREV_SEGMENT on DIM_CUSTOMERS — keep only 1 previous value.
+-- SCD4: History table. DIM_PRODUCT_PRICE_HISTORY — all prices in separate table.
+-- SCD6: Hybrid 1+2+3. DIM_CUSTOMERS — Type2 versioning + Type1 overwrite + Type3 prev value.
+--
+-- POINT-IN-TIME FK RESOLUTION (critical for SCD2 correctness):
+-- When loading a fact, always join to the dimension version active AT THE ORDER DATE:
+--   JOIN dim_customers c ON c.customer_id = f.customer_id
+--     AND order_date BETWEEN c.eff_start_date AND COALESCE(c.eff_end_date, '9999-12-31')
+-- NOT: JOIN dim_customers c ON c.customer_id = f.customer_id AND c.is_current = TRUE
+-- The second pattern gives you the CURRENT segment, not the segment at time of purchase!

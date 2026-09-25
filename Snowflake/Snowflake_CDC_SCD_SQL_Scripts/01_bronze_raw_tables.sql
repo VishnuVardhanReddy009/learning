@@ -1,0 +1,265 @@
+-- ============================================================
+-- FILE: 02_bronze/01_bronze_raw_tables.sql
+-- PURPOSE: Raw landing tables — source-exact, all VARCHAR
+--          Tracks every file load with metadata columns
+-- ============================================================
+
+USE ROLE DATA_ENG_ROLE;
+USE WAREHOUSE INGEST_WH;
+USE DATABASE BRONZE_DB;
+USE SCHEMA RAW;
+
+-- ─────────────────────────────────────────────────────────────
+-- CUSTOMERS — updates arrive daily as full-file extracts
+-- CDC Challenge: detect what actually changed since last load
+-- ─────────────────────────────────────────────────────────────
+CREATE TRANSIENT TABLE IF NOT EXISTS RAW_CUSTOMERS (
+    CUSTOMER_ID         VARCHAR(50),
+    CUSTOMER_NAME       VARCHAR(200),
+    EMAIL               VARCHAR(200),
+    PHONE               VARCHAR(30),
+    SEGMENT             VARCHAR(30),    -- Consumer|Corporate|Home Office
+    CITY                VARCHAR(100),
+    STATE               VARCHAR(100),
+    COUNTRY             VARCHAR(100),
+    POSTAL_CODE         VARCHAR(20),
+    REGION_ID           VARCHAR(20),
+    REGISTRATION_DATE   VARCHAR(20),
+    CREDIT_LIMIT        VARCHAR(20),
+    LOYALTY_TIER        VARCHAR(20),    -- SCD2 tracked
+    PREFERRED_CHANNEL   VARCHAR(30),    -- SCD2 tracked
+    IS_ACTIVE           VARCHAR(5),
+    -- ETL watermark
+    _LOAD_FILE          VARCHAR(500),
+    _LOAD_TS            TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    _LOAD_BATCH_ID      VARCHAR(100),
+    _SRC_ROW_HASH       VARCHAR(64),    -- hash of all business columns for CDC
+    _IS_PROCESSED       BOOLEAN DEFAULT FALSE
+);
+
+-- ORDERS — append-only transactional data (no updates expected)
+CREATE TRANSIENT TABLE IF NOT EXISTS RAW_ORDERS (
+    ORDER_ID            VARCHAR(50),
+    CUSTOMER_ID         VARCHAR(50),
+    STORE_ID            VARCHAR(50),
+    EMPLOYEE_ID         VARCHAR(50),
+    ORDER_DATE          VARCHAR(20),
+    SHIP_DATE           VARCHAR(20),
+    DELIVERY_DATE       VARCHAR(20),
+    STATUS              VARCHAR(20),    -- SCD2 tracked (status changes over time)
+    SHIP_MODE           VARCHAR(30),
+    TOTAL_AMOUNT        VARCHAR(20),
+    DISCOUNT_PCT        VARCHAR(10),
+    PROFIT              VARCHAR(20),
+    PAYMENT_METHOD      VARCHAR(30),
+    REGION_ID           VARCHAR(20),
+    _LOAD_FILE          VARCHAR(500),
+    _LOAD_TS            TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    _LOAD_BATCH_ID      VARCHAR(100),
+    _SRC_ROW_HASH       VARCHAR(64),
+    _IS_PROCESSED       BOOLEAN DEFAULT FALSE
+);
+
+-- PRODUCTS — updates (price, category changes need SCD2)
+CREATE TRANSIENT TABLE IF NOT EXISTS RAW_PRODUCTS (
+    PRODUCT_ID          VARCHAR(50),
+    PRODUCT_NAME        VARCHAR(300),
+    CATEGORY            VARCHAR(100),
+    SUB_CATEGORY        VARCHAR(100),
+    BRAND               VARCHAR(100),
+    UNIT_COST           VARCHAR(20),    -- SCD2 tracked (price changes)
+    UNIT_PRICE          VARCHAR(20),    -- SCD2 tracked
+    SUPPLIER_ID         VARCHAR(50),
+    IS_ACTIVE           VARCHAR(5),
+    LAUNCH_DATE         VARCHAR(20),
+    WEIGHT_KG           VARCHAR(10),
+    _LOAD_FILE          VARCHAR(500),
+    _LOAD_TS            TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    _LOAD_BATCH_ID      VARCHAR(100),
+    _SRC_ROW_HASH       VARCHAR(64),
+    _IS_PROCESSED       BOOLEAN DEFAULT FALSE
+);
+
+-- ORDER ITEMS — append-only line items
+CREATE TRANSIENT TABLE IF NOT EXISTS RAW_ORDER_ITEMS (
+    ITEM_ID             VARCHAR(50),
+    ORDER_ID            VARCHAR(50),
+    PRODUCT_ID          VARCHAR(50),
+    QUANTITY            VARCHAR(10),
+    UNIT_PRICE          VARCHAR(20),
+    DISCOUNT_AMOUNT     VARCHAR(20),
+    LINE_TOTAL          VARCHAR(20),
+    RETURN_FLAG         VARCHAR(5),
+    RETURN_DATE         VARCHAR(20),
+    _LOAD_FILE          VARCHAR(500),
+    _LOAD_TS            TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    _LOAD_BATCH_ID      VARCHAR(100),
+    _SRC_ROW_HASH       VARCHAR(64),
+    _IS_PROCESSED       BOOLEAN DEFAULT FALSE
+);
+
+-- EMPLOYEES — SCD Type 2 (department, title, manager changes)
+CREATE TRANSIENT TABLE IF NOT EXISTS RAW_EMPLOYEES (
+    EMPLOYEE_ID         VARCHAR(50),
+    EMPLOYEE_NAME       VARCHAR(200),
+    EMAIL               VARCHAR(200),
+    DEPARTMENT          VARCHAR(100),   -- SCD2: dept transfers
+    JOB_TITLE           VARCHAR(100),   -- SCD2: promotions
+    MANAGER_ID          VARCHAR(50),    -- SCD2: manager changes
+    STORE_ID            VARCHAR(50),
+    HIRE_DATE           VARCHAR(20),
+    SALARY              VARCHAR(20),    -- SCD2: salary changes
+    IS_ACTIVE           VARCHAR(5),
+    _LOAD_FILE          VARCHAR(500),
+    _LOAD_TS            TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    _LOAD_BATCH_ID      VARCHAR(100),
+    _SRC_ROW_HASH       VARCHAR(64),
+    _IS_PROCESSED       BOOLEAN DEFAULT FALSE
+);
+
+-- STORES — SCD Type 1 (simple overwrite for address updates)
+CREATE TRANSIENT TABLE IF NOT EXISTS RAW_STORES (
+    STORE_ID            VARCHAR(50),
+    STORE_NAME          VARCHAR(200),
+    STORE_TYPE          VARCHAR(50),    -- Physical|Online|Franchise
+    CITY                VARCHAR(100),
+    STATE               VARCHAR(100),
+    COUNTRY             VARCHAR(100),
+    REGION_ID           VARCHAR(20),
+    OPEN_DATE           VARCHAR(20),
+    MANAGER_ID          VARCHAR(50),
+    IS_ACTIVE           VARCHAR(5),
+    _LOAD_FILE          VARCHAR(500),
+    _LOAD_TS            TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    _LOAD_BATCH_ID      VARCHAR(100),
+    _SRC_ROW_HASH       VARCHAR(64),
+    _IS_PROCESSED       BOOLEAN DEFAULT FALSE
+);
+
+-- ─────────────────────────────────────────────────────────────
+-- LOAD HISTORY AUDIT
+-- ─────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS BRONZE_DB.ARCHIVE.LOAD_HISTORY (
+    HISTORY_ID      NUMBER AUTOINCREMENT PRIMARY KEY,
+    BATCH_ID        VARCHAR(100),
+    TABLE_NAME      VARCHAR(100),
+    STAGE_PATH      VARCHAR(500),
+    FILE_NAME       VARCHAR(500),
+    ROWS_LOADED     NUMBER DEFAULT 0,
+    ROWS_REJECTED   NUMBER DEFAULT 0,
+    STATUS          VARCHAR(20),
+    STARTED_AT      TIMESTAMP_NTZ,
+    COMPLETED_AT    TIMESTAMP_NTZ,
+    DURATION_SEC    NUMBER,
+    ERROR_MSG       VARCHAR(2000),
+    LOADED_BY       VARCHAR(100) DEFAULT CURRENT_USER()
+);
+
+-- ─────────────────────────────────────────────────────────────
+-- COPY INTO with row hash for CDC change detection
+-- ─────────────────────────────────────────────────────────────
+
+-- CUSTOMERS
+COPY INTO BRONZE_DB.RAW.RAW_CUSTOMERS (
+    CUSTOMER_ID,CUSTOMER_NAME,EMAIL,PHONE,SEGMENT,CITY,STATE,
+    COUNTRY,POSTAL_CODE,REGION_ID,REGISTRATION_DATE,CREDIT_LIMIT,
+    LOYALTY_TIER,PREFERRED_CHANNEL,IS_ACTIVE,
+    _LOAD_FILE, _LOAD_BATCH_ID, _SRC_ROW_HASH
+)
+FROM (
+    SELECT
+        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
+        METADATA$FILENAME,
+        TO_CHAR(CURRENT_TIMESTAMP(),'YYYYMMDD_HH24MISS'),
+        MD5(CONCAT_WS('|',$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15))
+    FROM @COMMON_DB.INGESTION.STG_S3_CUSTOMERS
+)
+FILE_FORMAT=(FORMAT_NAME='COMMON_DB.INGESTION.CSV_FMT')
+PATTERN='.*customers.*\\.csv(\\.gz)?'
+ON_ERROR='CONTINUE';
+
+-- ORDERS
+COPY INTO BRONZE_DB.RAW.RAW_ORDERS (
+    ORDER_ID,CUSTOMER_ID,STORE_ID,EMPLOYEE_ID,ORDER_DATE,SHIP_DATE,
+    DELIVERY_DATE,STATUS,SHIP_MODE,TOTAL_AMOUNT,DISCOUNT_PCT,PROFIT,
+    PAYMENT_METHOD,REGION_ID,
+    _LOAD_FILE,_LOAD_BATCH_ID,_SRC_ROW_HASH
+)
+FROM (
+    SELECT
+        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,
+        METADATA$FILENAME,
+        TO_CHAR(CURRENT_TIMESTAMP(),'YYYYMMDD_HH24MISS'),
+        MD5(CONCAT_WS('|',$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14))
+    FROM @COMMON_DB.INGESTION.STG_S3_ORDERS
+)
+FILE_FORMAT=(FORMAT_NAME='COMMON_DB.INGESTION.CSV_FMT')
+PATTERN='.*orders.*\\.csv(\\.gz)?' ON_ERROR='CONTINUE';
+
+-- PRODUCTS
+COPY INTO BRONZE_DB.RAW.RAW_PRODUCTS (
+    PRODUCT_ID,PRODUCT_NAME,CATEGORY,SUB_CATEGORY,BRAND,
+    UNIT_COST,UNIT_PRICE,SUPPLIER_ID,IS_ACTIVE,LAUNCH_DATE,WEIGHT_KG,
+    _LOAD_FILE,_LOAD_BATCH_ID,_SRC_ROW_HASH
+)
+FROM (
+    SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
+        METADATA$FILENAME,
+        TO_CHAR(CURRENT_TIMESTAMP(),'YYYYMMDD_HH24MISS'),
+        MD5(CONCAT_WS('|',$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11))
+    FROM @COMMON_DB.INGESTION.STG_S3_PRODUCTS
+)
+FILE_FORMAT=(FORMAT_NAME='COMMON_DB.INGESTION.CSV_FMT')
+PATTERN='.*products.*\\.csv(\\.gz)?' ON_ERROR='CONTINUE';
+
+-- EMPLOYEES
+COPY INTO BRONZE_DB.RAW.RAW_EMPLOYEES (
+    EMPLOYEE_ID,EMPLOYEE_NAME,EMAIL,DEPARTMENT,JOB_TITLE,
+    MANAGER_ID,STORE_ID,HIRE_DATE,SALARY,IS_ACTIVE,
+    _LOAD_FILE,_LOAD_BATCH_ID,_SRC_ROW_HASH
+)
+FROM (
+    SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+        METADATA$FILENAME,
+        TO_CHAR(CURRENT_TIMESTAMP(),'YYYYMMDD_HH24MISS'),
+        MD5(CONCAT_WS('|',$1,$2,$3,$4,$5,$6,$7,$8,$9,$10))
+    FROM @COMMON_DB.INGESTION.STG_S3_EMPLOYEES
+)
+FILE_FORMAT=(FORMAT_NAME='COMMON_DB.INGESTION.CSV_FMT')
+PATTERN='.*employees.*\\.csv(\\.gz)?' ON_ERROR='CONTINUE';
+
+-- STORES
+COPY INTO BRONZE_DB.RAW.RAW_STORES (
+    STORE_ID,STORE_NAME,STORE_TYPE,CITY,STATE,COUNTRY,
+    REGION_ID,OPEN_DATE,MANAGER_ID,IS_ACTIVE,
+    _LOAD_FILE,_LOAD_BATCH_ID,_SRC_ROW_HASH
+)
+FROM (
+    SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+        METADATA$FILENAME,
+        TO_CHAR(CURRENT_TIMESTAMP(),'YYYYMMDD_HH24MISS'),
+        MD5(CONCAT_WS('|',$1,$2,$3,$4,$5,$6,$7,$8,$9,$10))
+    FROM @COMMON_DB.INGESTION.STG_S3_STORES
+)
+FILE_FORMAT=(FORMAT_NAME='COMMON_DB.INGESTION.CSV_FMT')
+PATTERN='.*stores.*\\.csv(\\.gz)?' ON_ERROR='CONTINUE';
+
+-- Snowpipe for continuous order ingestion
+USE ROLE DATA_ENG_ROLE;
+CREATE PIPE IF NOT EXISTS COMMON_DB.INGESTION.PIPE_ORDERS
+    AUTO_INGEST=TRUE
+    ERROR_INTEGRATION=SNS_ALERTS
+AS
+    COPY INTO BRONZE_DB.RAW.RAW_ORDERS(
+        ORDER_ID,CUSTOMER_ID,STORE_ID,EMPLOYEE_ID,ORDER_DATE,SHIP_DATE,
+        DELIVERY_DATE,STATUS,SHIP_MODE,TOTAL_AMOUNT,DISCOUNT_PCT,PROFIT,
+        PAYMENT_METHOD,REGION_ID,_LOAD_FILE,_LOAD_BATCH_ID,_SRC_ROW_HASH
+    )
+    FROM(
+        SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,
+               METADATA$FILENAME,TO_CHAR(CURRENT_TIMESTAMP(),'YYYYMMDD_HH24MISS'),
+               MD5(CONCAT_WS('|',$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14))
+        FROM @COMMON_DB.INGESTION.STG_S3_ORDERS
+    )
+    FILE_FORMAT=(FORMAT_NAME='COMMON_DB.INGESTION.CSV_FMT')
+    ON_ERROR='CONTINUE';
